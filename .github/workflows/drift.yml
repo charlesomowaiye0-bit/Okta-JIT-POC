@@ -1,0 +1,33 @@
+name: drift
+on:
+  schedule: [{ cron: '0 6 * * *' }]
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        stack: [okta, aws-base, aws-app/janitor, aws-app/jit-frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TF_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: '1.6.6' }
+      - working-directory: 'infra/${{ matrix.stack }}'
+        run: |
+          terraform init -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}"
+          set +e
+          terraform plan -detailed-exitcode
+          EXIT=$?
+          if [ "$EXIT" = "2" ]; then
+            echo "::error::Drift in ${{ matrix.stack }}"
+            exit 1
+          fi
+          exit 0

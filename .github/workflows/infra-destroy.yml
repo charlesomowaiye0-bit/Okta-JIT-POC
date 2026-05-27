@@ -1,0 +1,170 @@
+name: infra-destroy
+on:
+  workflow_dispatch:
+    inputs:
+      aws_base:
+        description: 'Destroy infra/aws-base'
+        type: boolean
+        default: false
+      okta:
+        description: 'Destroy infra/okta'
+        type: boolean
+        default: false
+      janitor:
+        description: 'Destroy infra/aws-app/janitor'
+        type: boolean
+        default: false
+      jit_frontend:
+        description: 'Destroy infra/aws-app/jit-frontend'
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      aws_base:     ${{ steps.flags.outputs.aws_base }}
+      okta:         ${{ steps.flags.outputs.okta }}
+      janitor:      ${{ steps.flags.outputs.janitor }}
+      jit_frontend: ${{ steps.flags.outputs.jit_frontend }}
+    steps:
+      - id: flags
+        run: |
+          set -euo pipefail
+          aws_base="${{ inputs.aws_base }}"
+          okta="${{ inputs.okta }}"
+          janitor="${{ inputs.janitor }}"
+          jit_frontend="${{ inputs.jit_frontend }}"
+          {
+            echo "aws_base=$aws_base"
+            echo "okta=$okta"
+            echo "janitor=$janitor"
+            echo "jit_frontend=$jit_frontend"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## detected destroy selection"
+            echo ""
+            echo "| stack | destroy |"
+            echo "|---|---|"
+            echo "| aws-base | $aws_base |"
+            echo "| okta | $okta |"
+            echo "| janitor | $janitor |"
+            echo "| jit_frontend | $jit_frontend |"
+            if [ "$aws_base" = "true" ]; then
+              echo ""
+              echo "## Next: local bootstrap teardown"
+              echo ""
+              echo "Once this run finishes, tear down the bootstrap stack on your laptop:"
+              echo ""
+              echo '```'
+              echo "infra/bootstrap/cleanup.sh"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  destroy-jit-frontend:
+    needs: detect
+    if: needs.detect.outputs.jit_frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.6'
+      - name: destroy
+        working-directory: infra/aws-app/jit-frontend
+        run: |
+          set -euo pipefail
+          terraform init -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}"
+          terraform destroy -auto-approve
+
+  destroy-janitor:
+    needs: [detect, destroy-jit-frontend]
+    if: always()
+        && needs.destroy-jit-frontend.result != 'failure'
+        && needs.detect.outputs.janitor == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.6'
+      - name: destroy
+        working-directory: infra/aws-app/janitor
+        run: |
+          set -euo pipefail
+          terraform init -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}"
+          terraform destroy -auto-approve -var "github_repo=${{ github.repository }}"
+
+  destroy-okta:
+    needs: detect
+    if: needs.detect.outputs.okta == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.6'
+      - name: destroy
+        working-directory: infra/okta
+        run: |
+          set -euo pipefail
+          terraform init -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}"
+          terraform destroy -auto-approve
+
+  empty-ecrs:
+    needs: [detect, destroy-janitor, destroy-jit-frontend]
+    if: always()
+        && needs.destroy-janitor.result != 'failure'
+        && needs.destroy-jit-frontend.result != 'failure'
+        && needs.detect.outputs.aws_base == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: empty ECR repos
+        run: ./scripts/empty_ecrs.sh jit-janitor jit-streamlit
+
+  destroy-aws-base:
+    needs: [detect, destroy-okta, destroy-janitor, destroy-jit-frontend, empty-ecrs]
+    if: always()
+        && needs.destroy-okta.result != 'failure'
+        && needs.destroy-janitor.result != 'failure'
+        && needs.destroy-jit-frontend.result != 'failure'
+        && needs.empty-ecrs.result != 'failure'
+        && needs.detect.outputs.aws_base == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.6'
+      - name: destroy
+        working-directory: infra/aws-base
+        run: |
+          set -euo pipefail
+          terraform init -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}"
+          terraform destroy -auto-approve

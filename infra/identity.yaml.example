@@ -1,0 +1,24 @@
+# infra/identity.yaml
+# Source of truth for users + group memberships, consumed by both the
+# infra/okta/ and infra/aws-base/ Terraform stacks. Edit and re-apply both
+# stacks to sync (CI does this on push to main).
+#
+# Each user gets:
+#   - an Okta user (okta_user)
+#   - an AWS Identity Center user (aws_identitystore_user)
+#   - membership in each listed AWS Identity Center group
+#     (groups must also appear in the permission-set module's group_names input)
+#
+# Okta-side group membership is rule-based off `department` and `subteam`,
+# defined in infra/okta/group_rules.tf. The defaults below land the user
+# in the `jit-requesters` Okta group automatically.
+users:
+  - email: you@example.com
+    first_name: Your
+    last_name: Name
+    groups: [jit-requesters]
+  # - email: someone-else@example.com
+  #   first_name: Some
+  #   last_name: Other
+  #   groups: [jit-requesters]
+  #   subteam: platform

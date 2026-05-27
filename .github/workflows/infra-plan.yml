@@ -1,0 +1,78 @@
+name: infra-plan
+on:
+  pull_request:
+    paths: ['infra/**', '.github/workflows/infra-plan.yml']
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      stacks: ${{ steps.list.outputs.stacks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: changed
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            infra/okta/**
+            infra/aws-base/**
+            infra/aws-app/janitor/**
+            infra/aws-app/jit-frontend/**
+            infra/policies/**
+            infra/modules/**
+      - id: list
+        run: |
+          set -euo pipefail
+          stacks=()
+          files="${{ steps.changed.outputs.all_changed_files }}"
+          echo "$files" | grep -q '^infra/okta/'                && stacks+=(okta)               || true
+          echo "$files" | grep -q '^infra/aws-base/'            && stacks+=(aws-base)           || true
+          echo "$files" | grep -q '^infra/aws-app/janitor/'     && stacks+=(aws-app/janitor)    || true
+          echo "$files" | grep -q '^infra/aws-app/jit-frontend/' && stacks+=(aws-app/jit-frontend) || true
+          if echo "$files" | grep -qE '^infra/(modules|policies)/'; then
+            stacks=(okta aws-base aws-app/janitor aws-app/jit-frontend)
+          fi
+          echo "stacks=$(printf '%s\n' "${stacks[@]}" | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
+
+  opa-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: open-policy-agent/setup-opa@v2
+      - run: opa test infra/policies/
+
+  plan:
+    needs: [detect, opa-test]
+    if: needs.detect.outputs.stacks != '[]' && needs.detect.outputs.stacks != ''
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        stack: ${{ fromJson(needs.detect.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TF_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.6'
+      - uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: 'infra/${{ matrix.stack }}'
+      - name: plan
+        working-directory: infra/${{ matrix.stack }}
+        run: |
+          terraform init -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}"
+          terraform plan -no-color -out=plan.bin
+          terraform show -json plan.bin > plan.json
+      - uses: instrumenta/conftest-action@master
+        with:
+          files: 'infra/${{ matrix.stack }}/plan.json'
+          policy: 'infra/policies/'

@@ -1,0 +1,26 @@
+[project]
+name = "jit-poc"
+version = "0.0.0"
+requires-python = ">=3.12"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["app/streamlit", "app/lambdas/janitor"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "moto[dynamodb,s3,secretsmanager,scheduler]>=5.0",
+  "ruff>=0.4",
+  "respx>=0.21",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["app/tests"]
+pythonpath = ["."]

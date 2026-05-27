@@ -1,0 +1,117 @@
+name: app-ci
+on:
+  pull_request:
+    paths: ['app/**', '.github/workflows/app-ci.yml']
+  push:
+    branches: [main]
+    paths: ['app/**', '.github/workflows/app-ci.yml']
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: '0.11.16'
+      - run: uv sync --frozen --group dev
+      - run: uv run pytest app/tests -v
+
+  detect:
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      streamlit: ${{ steps.classify.outputs.streamlit }}
+      janitor:   ${{ steps.classify.outputs.janitor }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: gather-diff
+        if: github.event_name == 'push'
+        uses: tj-actions/changed-files@v44
+        with:
+          files_yaml: |
+            streamlit:
+              - app/streamlit/**
+              - app/shared/**
+            janitor:
+              - app/lambdas/janitor/**
+              - app/shared/**
+      - id: classify
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "streamlit=true" >> "$GITHUB_OUTPUT"
+            echo "janitor=true"   >> "$GITHUB_OUTPUT"
+          else
+            echo "streamlit=${{ steps.gather-diff.outputs.streamlit_any_changed }}" >> "$GITHUB_OUTPUT"
+            echo "janitor=${{ steps.gather-diff.outputs.janitor_any_changed }}"     >> "$GITHUB_OUTPUT"
+          fi
+
+  frontend-cicd:
+    needs: detect
+    if: needs.detect.outputs.streamlit == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+      - id: tag
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - name: build & push streamlit image (amd64)
+        run: |
+          ECR_URL=$(aws ecr describe-repositories --repository-names jit-streamlit --query 'repositories[0].repositoryUri' --output text)
+          IMG="$ECR_URL:${{ steps.tag.outputs.tag }}"
+          docker build -f app/streamlit/Dockerfile -t "$IMG" .
+          docker push "$IMG"
+          echo "STREAMLIT_IMAGE=$IMG" >> "$GITHUB_ENV"
+      - name: bump SSM image_tag
+        run: |
+          aws ssm put-parameter \
+            --name /jit/jit-frontend/image_tag \
+            --value "${{ steps.tag.outputs.tag }}" \
+            --type String --overwrite
+      - name: trigger infra-apply (aws-app/jit-frontend)
+        run: gh workflow run infra-apply.yml -f jit_frontend=true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  janitor-cicd:
+    needs: detect
+    if: needs.detect.outputs.janitor == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - id: tag
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - name: build & push janitor image (arm64)
+        run: |
+          ECR_URL=$(aws ecr describe-repositories --repository-names jit-janitor --query 'repositories[0].repositoryUri' --output text)
+          IMG="$ECR_URL:${{ steps.tag.outputs.tag }}"
+          docker buildx build --platform linux/arm64 --provenance=false --sbom=false -f app/lambdas/janitor/Dockerfile --push -t "$IMG" .
+          echo "JANITOR_IMAGE=$IMG" >> "$GITHUB_ENV"
+      - name: update Lambda function code
+        run: aws lambda update-function-code --function-name jit-janitor --image-uri "$JANITOR_IMAGE"
+      - name: bump SSM image_tag
+        run: |
+          aws ssm put-parameter \
+            --name /jit/janitor/image_tag \
+            --value "${{ steps.tag.outputs.tag }}" \
+            --type String --overwrite

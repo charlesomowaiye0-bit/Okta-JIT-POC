@@ -1,0 +1,233 @@
+name: infra-apply
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/okta/**'
+      - 'infra/aws-base/**'
+      - 'infra/aws-app/janitor/**'
+      - 'infra/aws-app/jit-frontend/**'
+      - 'infra/modules/**'
+      - 'infra/policies/**'
+      - 'infra/identity.yaml'
+      - '.github/workflows/infra-apply.yml'
+  workflow_dispatch:
+    inputs:
+      aws_base:
+        description: 'Apply infra/aws-base'
+        type: boolean
+        default: false
+      okta:
+        description: 'Apply infra/okta'
+        type: boolean
+        default: false
+      janitor:
+        description: 'Apply infra/aws-app/janitor'
+        type: boolean
+        default: false
+      jit_frontend:
+        description: 'Apply infra/aws-app/jit-frontend'
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      aws_base:     ${{ steps.flags.outputs.aws_base }}
+      okta:         ${{ steps.flags.outputs.okta }}
+      janitor:      ${{ steps.flags.outputs.janitor }}
+      jit_frontend: ${{ steps.flags.outputs.jit_frontend }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: changed
+        if: github.event_name == 'push'
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            infra/okta/**
+            infra/aws-base/**
+            infra/aws-app/janitor/**
+            infra/aws-app/jit-frontend/**
+            infra/policies/**
+            infra/modules/**
+            infra/identity.yaml
+      - id: flags
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            aws_base="${{ inputs.aws_base }}"
+            okta="${{ inputs.okta }}"
+            janitor="${{ inputs.janitor }}"
+            jit_frontend="${{ inputs.jit_frontend }}"
+          else
+            files="${{ steps.changed.outputs.all_changed_files }}"
+            aws_base=$(echo "$files" | grep -q '^infra/aws-base/'             && echo true || echo false)
+            okta=$(echo "$files"     | grep -q '^infra/okta/'                 && echo true || echo false)
+            janitor=$(echo "$files"  | grep -q '^infra/aws-app/janitor/'      && echo true || echo false)
+            jit_frontend=$(echo "$files" | grep -q '^infra/aws-app/jit-frontend/' && echo true || echo false)
+            if echo "$files" | grep -qE '^infra/(modules|policies)/'; then
+              aws_base=true; okta=true; janitor=true; jit_frontend=true
+            fi
+            if echo "$files" | grep -q '^infra/identity.yaml$'; then
+              aws_base=true; okta=true
+            fi
+          fi
+          {
+            echo "aws_base=$aws_base"
+            echo "okta=$okta"
+            echo "janitor=$janitor"
+            echo "jit_frontend=$jit_frontend"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## detected stack selection"
+            echo ""
+            echo "| stack | apply |"
+            echo "|---|---|"
+            echo "| aws-base | $aws_base |"
+            echo "| okta | $okta |"
+            echo "| janitor | $janitor |"
+            echo "| jit_frontend | $jit_frontend |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply-aws-base:
+    needs: detect
+    if: needs.detect.outputs.aws_base == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.6'
+      - name: apply
+        working-directory: infra/aws-base
+        run: |
+          set -euo pipefail
+          terraform init -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}"
+          terraform apply -auto-approve
+
+  apply-okta:
+    needs: [detect, apply-aws-base]
+    if: always()
+        && needs.apply-aws-base.result != 'failure'
+        && needs.detect.outputs.okta == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.6'
+      - name: apply
+        working-directory: infra/okta
+        run: |
+          set -euo pipefail
+          terraform init -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}"
+          terraform apply -auto-approve
+
+  seed-images:
+    needs: [detect, apply-aws-base]
+    if: always()
+        && needs.apply-aws-base.result != 'failure'
+        && (needs.detect.outputs.janitor == 'true' || needs.detect.outputs.jit_frontend == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: verify ECRs exist
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories \
+            --repository-names jit-janitor jit-streamlit >/dev/null \
+            || { echo "::error::ECR repos missing — apply aws-base first"; exit 1; }
+      - name: seed jit-janitor:bootstrap
+        run: ./scripts/seed_janitor_bootstrap.sh
+      - name: seed jit-streamlit:bootstrap
+        run: ./scripts/seed_streamlit_bootstrap.sh
+
+  apply-janitor:
+    needs: [detect, seed-images]
+    if: always()
+        && needs.seed-images.result == 'success'
+        && needs.detect.outputs.janitor == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.6'
+      - name: preflight ECR image
+        run: |
+          aws ecr describe-images \
+            --repository-name jit-janitor \
+            --image-ids imageTag=bootstrap >/dev/null \
+            || { echo "::error::jit-janitor:bootstrap missing — re-run with janitor=true to re-seed"; exit 1; }
+      - name: apply
+        working-directory: infra/aws-app/janitor
+        run: |
+          set -euo pipefail
+          terraform init -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}"
+          terraform apply -auto-approve -var "github_repo=${{ github.repository }}"
+
+  apply-jit-frontend:
+    needs: [detect, seed-images, apply-janitor]
+    if: always()
+        && needs.seed-images.result == 'success'
+        && needs.apply-janitor.result != 'failure'
+        && needs.detect.outputs.jit_frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.6'
+      - name: preflight ECR image
+        run: |
+          aws ecr describe-images \
+            --repository-name jit-streamlit \
+            --image-ids imageTag=bootstrap >/dev/null \
+            || { echo "::error::jit-streamlit:bootstrap missing — re-run with jit_frontend=true to re-seed"; exit 1; }
+      - name: apply
+        working-directory: infra/aws-app/jit-frontend
+        run: |
+          set -euo pipefail
+          terraform init -backend-config="bucket=${{ vars.STATE_BUCKET_NAME }}"
+          terraform apply -auto-approve
+      - name: surface streamlit console link
+        run: |
+          set -euo pipefail
+          CONSOLE="https://us-east-1.console.aws.amazon.com/ecs/v2/clusters/default/express-services/jit-frontend/resources"
+          {
+            echo "## Streamlit"
+            echo ""
+            echo "AWS assigns a random hostname per express service. Open the console to grab the live Application URL:"
+            echo ""
+            echo "[$CONSOLE]($CONSOLE)"
+          } >> "$GITHUB_STEP_SUMMARY"
